@@ -43,5 +43,43 @@ export class SessionManager {
    if(u.connection==="open"){runtime.status="CONNECTED";runtime.qr=null;runtime.expires=null;const phone=socket.user?.id?jidNormalizedUser(socket.user.id).split("@")[0]:null;await this.update(row.id,"CONNECTED",{phone_number:phone,display_name:socket.user?.name||null,last_connected_at:new Date().toISOString(),last_error:null});}
    if(u.connection==="close"){const boom=u.lastDisconnect?.error as Boom|undefined; if(boom?.output?.statusCode===DisconnectReason.loggedOut){this.runtimes.delete(row.id);await removeDir(dir);await this.update(row.id,"LOGGED_OUT");return;} runtime.status="RECONNECTING";this.runtimes.delete(row.id);await this.update(row.id,"RECONNECTING",{last_error:boom?.message||"Conexão interrompida"});setTimeout(()=>this.start(row).catch(()=>{}),3000);}
   });
+
+  socket.ev.on("messages.upsert", async ({ messages }) => {
+   for (const msg of messages) {
+    try {
+     const remoteJid=msg.key.remoteJid, messageId=msg.key.id;
+     if(!remoteJid||!messageId||!msg.message||remoteJid==="status@broadcast") continue;
+     const phone=remoteJid.endsWith("@g.us")?remoteJid:remoteJid.split("@")[0].split(":")[0].replace(/\\D/g,"");
+     if(!phone) continue;
+     const {data:contact,error:ce}=await supabase.from("whatsapp_contacts").upsert({
+      organization_id:row.organization_id,wa_id:remoteJid,phone_number:phone,name:msg.pushName||null,updated_at:new Date().toISOString()
+     },{onConflict:"organization_id,phone_number"}).select("id").single();
+     if(ce) throw ce;
+     const ts=Number(msg.messageTimestamp||0); const eventTime=ts>0?new Date(ts*1000).toISOString():new Date().toISOString();
+     const {data:conversation,error:ve}=await supabase.from("whatsapp_conversations").upsert({
+      organization_id:row.organization_id,connection_id:row.id,contact_id:contact.id,last_message_at:eventTime,status:"OPEN"
+     },{onConflict:"connection_id,contact_id"}).select("id,unread_count").single();
+     if(ve) throw ve;
+     const exists=await supabase.from("whatsapp_messages").select("id").eq("connection_id",row.id).eq("external_message_id",messageId).maybeSingle();
+     if(exists.data) continue;
+     const type=msg.message.conversation||msg.message.extendedTextMessage?"text":msg.message.imageMessage?"image":msg.message.videoMessage?"video":msg.message.audioMessage?"audio":msg.message.documentMessage?"document":"other";
+     const body=msg.message.conversation||msg.message.extendedTextMessage?.text||msg.message.imageMessage?.caption||msg.message.videoMessage?.caption||msg.message.documentMessage?.caption||null;
+     const inbound=!msg.key.fromMe;
+     const {error:me}=await supabase.from("whatsapp_messages").insert({
+      organization_id:row.organization_id,conversation_id:conversation.id,connection_id:row.id,external_message_id:messageId,
+      direction:inbound?"INBOUND":"OUTBOUND",sender_wa_id:msg.key.participant||(inbound?remoteJid:socket.user?.id)||null,
+      message_type:type,body,status:inbound?"RECEIVED":"SENT",sent_at:inbound?null:eventTime,received_at:inbound?eventTime:null
+     });
+     if(me) throw me;
+     await supabase.from("whatsapp_conversations").update({
+      last_message_at:eventTime,unread_count:inbound?Number(conversation.unread_count||0)+1:Number(conversation.unread_count||0)
+     }).eq("id",conversation.id);
+    } catch(e){ logger.error({e,connectionId:row.id},"persist message"); }
+   }
+  });
+
+  socket.ev.on("messages.update", async (updates) => {
+   for(const item of updates){const id=item.key.id;if(!id)continue;const n=Number(item.update.status||0);const status=n>=4?"READ":n===3?"DELIVERED":n===2?"SENT":null;if(status)await supabase.from("whatsapp_messages").update({status}).eq("connection_id",row.id).eq("external_message_id",id);}
+  });
  }
 }
