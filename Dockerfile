@@ -16,8 +16,7 @@ RUN npm run build && npm prune --omit=dev
 ENV NODE_ENV=production
 ENV PORT=3000
 
-RUN mkdir -p /data/sessions && chown -R node:node /data /app
-USER node
-
+RUN mkdir -p /data/sessions
 EXPOSE 3000
-CMD ["npm","start"]
+
+CMD ["sh","-lc","mkdir -p /data/sessions && exec npm start"]
