@@ -36,7 +36,7 @@ export class SessionManager {
  private async start(row:Row){
   if(this.runtimes.has(row.id))return; const dir=sessionPath(config.sessionRoot,row.session_id); await ensureDir(dir); await this.update(row.id,"CONNECTING");
   const {state,saveCreds}=await useMultiFileAuthState(dir); const {version}=await fetchLatestBaileysVersion();
-  const socket=makeWASocket({version,auth:state,printQRInTerminal:false,browser:Browsers.ubuntu("Montreal WhatsApp"),logger:logger.child({connectionId:row.id}),markOnlineOnConnect:false});
+  const socket=makeWASocket({version,auth:state,printQRInTerminal:false,browser:Browsers.macOS("Desktop"),syncFullHistory:true,shouldSyncHistoryMessage:()=>true,logger:logger.child({connectionId:row.id}),markOnlineOnConnect:false});
   const runtime:Runtime={row,socket,status:"CONNECTING",qr:null,expires:null}; this.runtimes.set(row.id,runtime); socket.ev.on("creds.update",saveCreds);
   socket.ev.on("connection.update",async u=>{
    if(u.qr){runtime.status="QR_REQUIRED";runtime.qr=await QRCode.toDataURL(u.qr,{margin:1,width:320});runtime.expires=new Date(Date.now()+60000).toISOString();await this.update(row.id,"QR_REQUIRED");}
@@ -44,24 +44,39 @@ export class SessionManager {
    if(u.connection==="close"){const boom=u.lastDisconnect?.error as Boom|undefined; if(boom?.output?.statusCode===DisconnectReason.loggedOut){this.runtimes.delete(row.id);await removeDir(dir);await this.update(row.id,"LOGGED_OUT");return;} runtime.status="RECONNECTING";this.runtimes.delete(row.id);await this.update(row.id,"RECONNECTING",{last_error:boom?.message||"Conexão interrompida"});setTimeout(()=>this.start(row).catch(()=>{}),3000);}
   });
 
-  socket.ev.on("messages.upsert", async ({ messages }) => {
-   for (const msg of messages) {
-    try {
-     const remoteJid=msg.key.remoteJid, messageId=msg.key.id;
-     if(!remoteJid||!messageId||!msg.message||remoteJid==="status@broadcast") continue;
+  socket.ev.on("messaging-history.set", async ({ chats, contacts, messages, progress, isLatest }) => {
+   logger.info({connectionId:row.id,chats:chats.length,contacts:contacts.length,messages:messages.length,progress,isLatest},"history sync received");
+   for(const ct of contacts){
+    try{
+     const jid=ct.id; if(!jid||jid==="status@broadcast")continue;
+     const phone=jid.endsWith("@g.us")?jid:jid.split("@")[0].split(":")[0].replace(/\\D/g,"");
+     if(!phone)continue;
+     await supabase.from("whatsapp_contacts").upsert({
+      organization_id:row.organization_id,wa_id:jid,phone_number:phone,name:ct.name||ct.notify||ct.verifiedName||null,updated_at:new Date().toISOString()
+     },{onConflict:"organization_id,phone_number"});
+    }catch(e){logger.warn({e},"history contact");}
+   }
+   for(const msg of messages){
+    try{await persistMessage(msg,false);}catch(e){logger.error({e,connectionId:row.id},"history message");}
+   }
+  });
+
+  const persistMessage=async(msg:any,countUnread=true)=>{
+     const remoteJid=msg.key?.remoteJid, messageId=msg.key?.id;
+     if(!remoteJid||!messageId||!msg.message||remoteJid==="status@broadcast") return;
      const phone=remoteJid.endsWith("@g.us")?remoteJid:remoteJid.split("@")[0].split(":")[0].replace(/\\D/g,"");
-     if(!phone) continue;
+     if(!phone)return;
      const {data:contact,error:ce}=await supabase.from("whatsapp_contacts").upsert({
       organization_id:row.organization_id,wa_id:remoteJid,phone_number:phone,name:msg.pushName||null,updated_at:new Date().toISOString()
      },{onConflict:"organization_id,phone_number"}).select("id").single();
-     if(ce) throw ce;
+     if(ce)throw ce;
      const ts=Number(msg.messageTimestamp||0); const eventTime=ts>0?new Date(ts*1000).toISOString():new Date().toISOString();
      const {data:conversation,error:ve}=await supabase.from("whatsapp_conversations").upsert({
       organization_id:row.organization_id,connection_id:row.id,contact_id:contact.id,last_message_at:eventTime,status:"OPEN"
      },{onConflict:"connection_id,contact_id"}).select("id,unread_count").single();
-     if(ve) throw ve;
+     if(ve)throw ve;
      const exists=await supabase.from("whatsapp_messages").select("id").eq("connection_id",row.id).eq("external_message_id",messageId).maybeSingle();
-     if(exists.data) continue;
+     if(exists.data)return;
      const type=msg.message.conversation||msg.message.extendedTextMessage?"text":msg.message.imageMessage?"image":msg.message.videoMessage?"video":msg.message.audioMessage?"audio":msg.message.documentMessage?"document":"other";
      const body=msg.message.conversation||msg.message.extendedTextMessage?.text||msg.message.imageMessage?.caption||msg.message.videoMessage?.caption||msg.message.documentMessage?.caption||null;
      const inbound=!msg.key.fromMe;
@@ -70,12 +85,14 @@ export class SessionManager {
       direction:inbound?"INBOUND":"OUTBOUND",sender_wa_id:msg.key.participant||(inbound?remoteJid:socket.user?.id)||null,
       message_type:type,body,status:inbound?"RECEIVED":"SENT",sent_at:inbound?null:eventTime,received_at:inbound?eventTime:null
      });
-     if(me) throw me;
+     if(me)throw me;
      await supabase.from("whatsapp_conversations").update({
-      last_message_at:eventTime,unread_count:inbound?Number(conversation.unread_count||0)+1:Number(conversation.unread_count||0)
+      last_message_at:eventTime,unread_count:countUnread&&inbound?Number(conversation.unread_count||0)+1:Number(conversation.unread_count||0)
      }).eq("id",conversation.id);
-    } catch(e){ logger.error({e,connectionId:row.id},"persist message"); }
-   }
+  };
+
+  socket.ev.on("messages.upsert", async ({ messages }) => {
+   for(const msg of messages){try{await persistMessage(msg,true);}catch(e){logger.error({e,connectionId:row.id},"persist message");}}
   });
 
   socket.ev.on("messages.update", async (updates) => {
