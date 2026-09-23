@@ -1,0 +1,25 @@
+{
+  "name": "montreal-whatsapp-service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@hapi/boom": "10.0.1",
+    "@supabase/supabase-js": "2.57.4",
+    "@whiskeysockets/baileys": "6.7.24",
+    "express": "5.1.0",
+    "pino": "9.9.4",
+    "qrcode": "1.5.4"
+  },
+  "devDependencies": {
+    "@types/express": "5.0.3",
+    "@types/node": "22.18.6",
+    "@types/qrcode": "1.5.5",
+    "typescript": "5.9.2"
+  }
+}
